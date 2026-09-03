@@ -1,0 +1,13 @@
+[project]
+name = "pura-services"
+version = "2.0.0"
+description = "A zero-dependency, private LAN sharing dashboard designed for personal trusted networks."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Pura Services" }
+]
+license = { text = "MIT" }
+
+[project.urls]
+Homepage = "https://github.com/puraservices/puraservices"

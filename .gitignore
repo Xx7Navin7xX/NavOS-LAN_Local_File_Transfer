@@ -1,0 +1,57 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE metadata
+.vscode/
+.idea/
+*.swp
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Temp, logs, and backup files
+*.tmp
+.upload-*
+*.bak
+*.log
+
+# Runtime shared files and uploaded files
+shared_files/*
+!shared_files/.gitkeep
+
+# Persistence and configuration
+clipboard_items.json
+.pura_device_names.json
+.pura_config.json
+.pura_file_expiry.json
+pura_data.db
+*.db
+
+# TLS Certificates and Private Keys (Local only, never committed)
+cert/
+.pura_tls/
+*.crt
+*.key
+*.pem
+*.pfx
+
+# Test artifacts
+test_output.txt
+scratch/
+shared_files_rc_test/
+shared_files_sec_test/
+shared_files_test/
