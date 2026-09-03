@@ -26,7 +26,7 @@ for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "C:\Program Files\Pytho
     if exist "%%~D\python.exe" (
         "%%~D\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
         if !ERRORLEVEL! EQU 0 (
-            set "PYTHON_CMD=%%~D\python.exe"
+            set "PYTHON_CMD="%%~D\python.exe""
             goto :RUN_SERVER
         )
     )
@@ -78,7 +78,7 @@ python --version >nul 2>&1 && set "PYTHON_CMD=python" && goto :RUN_SERVER
 
 for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "C:\Program Files\Python3*" "C:\Python3*") do (
     if exist "%%~D\python.exe" (
-        set "PYTHON_CMD=%%~D\python.exe"
+        set "PYTHON_CMD="%%~D\python.exe""
         goto :RUN_SERVER
     )
 )

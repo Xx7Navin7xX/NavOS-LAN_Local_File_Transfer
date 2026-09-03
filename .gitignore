@@ -55,3 +55,6 @@ scratch/
 shared_files_rc_test/
 shared_files_sec_test/
 shared_files_test/
+shared_files_hardening_test/
+cert_privacy_test/
+Pura_server_hardened.py

@@ -3981,9 +3981,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       let offset = 0;
       const total = file.size;
       const startTime = performance.now();
-      // Optimal chunk size for high-throughput LAN streaming with bounded memory: 8MB for >50MB, 4MB for >5MB, 2MB for smaller
-      const chunkSizeDynamic = file.size > 50 * 1024 * 1024 ? 8 * 1024 * 1024
-        : (file.size > 5 * 1024 * 1024 ? 4 * 1024 * 1024 : 2 * 1024 * 1024);
+      // Calibrated chunk size for smooth LAN streaming & continuous progress updates:
+      const chunkSizeDynamic = file.size > 100 * 1024 * 1024 ? 4 * 1024 * 1024
+        : (file.size > 10 * 1024 * 1024 ? 2 * 1024 * 1024 : 1024 * 1024);
 
       while (offset < total && !uploadCanceled) {
         while (uploadPaused && !uploadCanceled) {

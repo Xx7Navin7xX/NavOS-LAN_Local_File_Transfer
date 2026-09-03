@@ -1,4 +1,4 @@
-# புரா சேவைகள் | Pura Services
+# NavOS - LAN Local File Transfer
 
 A modern, lightweight, private local-network dashboard for sharing files, clipboard text, links, and device tools between devices on the same Wi-Fi or LAN.
 

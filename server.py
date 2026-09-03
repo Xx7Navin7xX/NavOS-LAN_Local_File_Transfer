@@ -9,13 +9,16 @@ persistent clipboard inbox, offline QR code generation, and multi-device synchro
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import secrets
 import shutil
+import subprocess
 import socket
 import ssl
 import sys
@@ -33,6 +36,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_TITLE = "புரா சேவைகள்"
 CHUNK_SIZE = 1024 * 1024
+STREAM_BUFFER_SIZE = 64 * 1024
 DEFAULT_MAX_UPLOAD_GB = 10
 DEFAULT_PIN = "".join(secrets.choice("0123456789") for _ in range(4))
 DISCOVERY_PORT = 52002
@@ -40,6 +44,13 @@ MAX_CLIPBOARD_BYTES = 512 * 1024
 MAX_CLIPBOARD_ITEMS = 30
 MAX_ACTIVITY_EVENTS = 50
 RESUMABLE_STALE_SECONDS = 24 * 60 * 60  # 24 hours
+MAX_RESUMABLE_CHUNK_BYTES = 5 * 1024 * 1024  # 5 MB hard limit per chunk
+MAX_ACTIVE_RESUMABLE_SESSIONS = 25
+MAX_SSE_CLIENTS = 20
+MAX_TRACKED_DEVICES = 64
+DEVICE_STALE_SECONDS = 24 * 60 * 60
+MAX_CONCURRENT_ZIPS = 2
+MAX_ZIP_FILES = 100_000
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -4025,9 +4036,9 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
       let offset = 0;
       const total = file.size;
       const startTime = performance.now();
-      // Optimal chunk size for high-throughput LAN streaming with bounded memory: 8MB for >50MB, 4MB for >5MB, 2MB for smaller
-      const chunkSizeDynamic = file.size > 50 * 1024 * 1024 ? 8 * 1024 * 1024
-        : (file.size > 5 * 1024 * 1024 ? 4 * 1024 * 1024 : 2 * 1024 * 1024);
+      // Calibrated chunk size for smooth LAN streaming & continuous progress updates:
+      const chunkSizeDynamic = file.size > 100 * 1024 * 1024 ? 4 * 1024 * 1024
+        : (file.size > 10 * 1024 * 1024 ? 2 * 1024 * 1024 : 1024 * 1024);
 
       while (offset < total && !uploadCanceled) {
         while (uploadPaused && !uploadCanceled) {
@@ -5231,7 +5242,11 @@ def generate_self_signed_cert(
     san_ips: list[str] | str | None = None,
     san_dns: list[str] | None = None
 ) -> bool:
-    """Generate a 2048-bit self-signed certificate and private key with authoritative IP and DNS SAN extensions."""
+    """Generate a 2048-bit self-signed certificate with IP/DNS SANs.
+
+    Uses the OpenSSL command-line tool when available and falls back to the
+    built-in Python implementation when OpenSSL is unavailable.
+    """
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -5253,18 +5268,12 @@ def generate_self_signed_cert(
                 pass
 
     unique_dns: list[str] = ["localhost"]
-    try:
-        h = socket.gethostname()
-        if h and h not in unique_dns:
-            unique_dns.append(h)
-    except Exception:
-        pass
     if san_dns:
         for d in san_dns:
             if d and d not in unique_dns:
                 unique_dns.append(d)
 
-    # Strategy 1: Try OpenSSL CLI with SAN config if available
+    # Strategy 1: Use OpenSSL CLI with SAN config when available; fall back to pure Python below.
     if shutil.which("openssl"):
         cnf_path = None
         try:
@@ -5297,7 +5306,7 @@ def generate_self_signed_cert(
             if cnf_path and cnf_path.exists():
                 cnf_path.unlink(missing_ok=True)
 
-    # Strategy 2: Pure Python standard library RSA 2048 & ASN.1 DER with SAN extension
+    # Strategy 2: Pure-Python standard-library RSA 2048 & ASN.1 DER fallback with SAN extension
     try:
         def is_prime(n, k=30):
             if n < 2: return False
@@ -5649,14 +5658,10 @@ class LanDiscoveryService:
                     continue
 
                 peer_name = str(packet.get("name", "Pura Server"))[:60].strip() or "Pura Server"
-                peer_host = str(packet.get("host", addr[0])).strip()
-                if peer_host in ("127.0.0.1", "localhost", ""):
-                    peer_host = addr[0]
-
-                # Sanitize & validate URL
-                peer_url = str(packet.get("url", f"{peer_protocol}://{peer_host}:{peer_port}/")).strip()
-                if not (peer_url.startswith("http://") or peer_url.startswith("https://")):
-                    peer_url = f"{peer_protocol}://{peer_host}:{peer_port}/"
+                # Never trust host/url advertised by an unauthenticated UDP peer.
+                # The packet sender address is the authoritative LAN host.
+                peer_host = addr[0]
+                peer_url = f"{peer_protocol}://{peer_host}:{peer_port}/"
 
                 peer_auth = bool(packet.get("auth_enabled", False))
 
@@ -5706,6 +5711,9 @@ class LanDiscoveryService:
     def get_peers(self) -> list[dict]:
         now = time.time()
         with self.lock:
+            stale = [pid for pid, p in self.discovered_peers.items() if now - p.get("last_seen", 0) > 15]
+            for pid in stale:
+                self.discovered_peers.pop(pid, None)
             return [
                 {
                     "server_id": pid,
@@ -5779,12 +5787,17 @@ def load_file_expiry(path: Path, share_dir: Path) -> dict[str, float]:
         return {}
     now = time.time()
     result: dict[str, float] = {}
-    for filename, expires_at in data.items():
+    share_root = share_dir.resolve()
+    for rel_key, expires_at in data.items():
         try:
             ts = float(expires_at)
         except (TypeError, ValueError):
             continue
-        file_path = share_dir / str(filename)
+        try:
+            file_path = (share_dir / str(rel_key).replace("/", os.sep)).resolve()
+            file_path.relative_to(share_root)
+        except (OSError, ValueError):
+            continue
         if not file_path.is_file():
             continue
         if ts <= now:
@@ -5793,7 +5806,7 @@ def load_file_expiry(path: Path, share_dir: Path) -> dict[str, float]:
             except OSError:
                 pass
             continue
-        result[str(filename)] = ts
+        result[str(rel_key).replace("\\", "/")] = ts
     return result
 
 
@@ -6003,6 +6016,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
     event_version: int
     resumable_uploads: dict[str, dict]
     resumable_uploads_lock: threading.Lock
+    active_sse_clients: int = 0
+    sse_lock: threading.Lock = threading.Lock()
+    zip_semaphore: threading.Semaphore = threading.Semaphore(MAX_CONCURRENT_ZIPS)
     activity_events: list[dict]
     activity_lock: threading.Lock
 
@@ -6096,14 +6112,23 @@ class FileShareHandler(BaseHTTPRequestHandler):
         agent = self.headers.get("User-Agent", "Unknown")
         short_agent = agent.split(")")[0].replace("Mozilla/5.0 (", "")[:42] or "Browser"
         key = f"{self.client_address[0]}|{short_agent}"
+        now = time.time()
         cls = self.__class__
         with cls.devices_lock:
-            existing = cls.devices.get(key, {})
+            existing = cls.devices.get(key)
+            if existing is None and len(cls.devices) >= MAX_TRACKED_DEVICES:
+                stale_keys = [k for k, d in cls.devices.items() if now - d.get("last_seen", 0) > 3600]
+                for k in stale_keys:
+                    cls.devices.pop(k, None)
+                while len(cls.devices) >= MAX_TRACKED_DEVICES:
+                    oldest_key = min(cls.devices.keys(), key=lambda k: cls.devices[k].get("last_seen", 0))
+                    cls.devices.pop(oldest_key, None)
+
             saved_name = cls.device_names.get(key, "")
-            device_name = existing.get("name") or saved_name or self.default_device_name(short_agent)
-            
+            device_name = existing.get("name") if existing else (saved_name or self.default_device_name(short_agent))
+
             is_new_connection = False
-            if not existing or (time.time() - existing.get("last_seen", 0) > 300):
+            if not existing or (now - existing.get("last_seen", 0) > 300):
                 is_new_connection = True
 
             cls.devices[key] = {
@@ -6111,12 +6136,11 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 "ip": self.client_address[0],
                 "agent": short_agent,
                 "name": device_name,
-                "last_seen": time.time(),
+                "last_seen": now,
             }
-        
+
         if is_new_connection:
             self.add_activity(f"{device_name} connected")
-
 
     def default_device_name(self, agent: str) -> str:
         agent_lower = agent.lower()
@@ -6134,6 +6158,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
         now = time.time()
         cls = self.__class__
         with cls.devices_lock:
+            stale_keys = [k for k, d in cls.devices.items() if now - d.get("last_seen", 0) > DEVICE_STALE_SECONDS]
+            for k in stale_keys:
+                cls.devices.pop(k, None)
             devices = sorted(cls.devices.values(), key=lambda item: item["last_seen"], reverse=True)
         return [
             {
@@ -6240,20 +6267,32 @@ class FileShareHandler(BaseHTTPRequestHandler):
         self.send_json(data)
 
     def send_events(self) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        last_seen = self.event_version
+        cls = self.__class__
+        with cls.sse_lock:
+            if cls.active_sse_clients >= MAX_SSE_CLIENTS:
+                self.send_error_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    f"Maximum concurrent event streams ({MAX_SSE_CLIENTS}) reached",
+                )
+                return
+            cls.active_sse_clients += 1
+
         try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            last_seen = cls.event_version
             self.wfile.write(f"event: update\ndata: {last_seen}\n\n".encode("utf-8"))
             self.wfile.flush()
-            deadline = time.time() + 60 * 60
+
+            deadline = time.time() + 300  # 5 minutes bounded thread lifetime
             while time.time() < deadline:
-                with self.event_condition:
-                    self.event_condition.wait(timeout=25)
-                    version = self.event_version
+                with cls.event_condition:
+                    cls.event_condition.wait(timeout=15)
+                    version = cls.event_version
                 if version != last_seen:
                     last_seen = version
                     payload = f"event: update\ndata: {version}\n\n"
@@ -6261,8 +6300,11 @@ class FileShareHandler(BaseHTTPRequestHandler):
                     payload = ": keep-alive\n\n"
                 self.wfile.write(payload.encode("utf-8"))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionError, OSError):
-            return
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError, OSError):
+            pass
+        finally:
+            with cls.sse_lock:
+                cls.active_sse_clients = max(0, cls.active_sse_clients - 1)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -6313,25 +6355,29 @@ class FileShareHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = parse_json_body(self)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (json.JSONDecodeError, ValueError):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
             return
         new_name = sanitize_filename(str(payload.get("name", "")))
         if not new_name:
             self.send_error_json(HTTPStatus.BAD_REQUEST, "Missing new file name")
             return
-        destination = self.share_dir / new_name
+        # Rename in place: preserve the file/folder's existing parent directory.
+        # The resolved source path has already been constrained to share_dir.
+        destination = path.parent / new_name
         if destination.exists() and destination.resolve() != path.resolve():
-            destination = unique_path(self.share_dir, new_name)
+            destination = unique_path(path.parent, new_name)
         try:
             path.rename(destination)
         except OSError as exc:
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Rename failed")
             return
         with self.file_expiry_lock:
-            expires_at = self.file_expiry.pop(path.name, None)
+            old_rel = str(path.relative_to(self.share_dir)).replace(os.sep, "/")
+            new_rel = str(destination.relative_to(self.share_dir)).replace(os.sep, "/")
+            expires_at = self.file_expiry.pop(old_rel, self.file_expiry.pop(path.name, None))
             if expires_at:
-                self.file_expiry[destination.name] = expires_at
+                self.file_expiry[new_rel] = expires_at
                 save_file_expiry(self.file_expiry_path, self.file_expiry)
         self.send_json({"ok": True, "name": destination.name, "url": f"/files/{quote(destination.name)}"})
         self.notify_update()
@@ -6339,8 +6385,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
     def update_device_name(self) -> None:
         try:
             payload = parse_json_body(self, limit=4096)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (json.JSONDecodeError, ValueError):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
             return
         device_id = str(payload.get("id", "")).strip()
         name = re.sub(r"\s+", " ", str(payload.get("name", "")).strip())[:36]
@@ -6366,32 +6412,6 @@ class FileShareHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "name": name})
         self.notify_update()
 
-    def send_events(self) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        last_version = self.__class__.event_version
-        try:
-            self.wfile.write(b": keepalive\n\n")
-            self.wfile.flush()
-            while True:
-                with self.event_condition:
-                    if self.__class__.event_version == last_version:
-                        self.event_condition.wait(timeout=15.0)
-                    if self.__class__.event_version != last_version:
-                        last_version = self.__class__.event_version
-                        self.wfile.write(b"event: update\ndata: {}\n\n")
-                        self.wfile.flush()
-                    else:
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         if not self.require_auth():
@@ -6405,18 +6425,29 @@ class FileShareHandler(BaseHTTPRequestHandler):
             if path is None:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "File not found")
                 return
+            share_root = self.share_dir.resolve()
             if path.is_dir():
+                rel_dir = str(path.resolve().relative_to(share_root)).replace(os.sep, "/")
                 try:
                     shutil.rmtree(path)
                 except OSError as exc:
                     self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Delete failed")
                     return
+                with self.file_expiry_lock:
+                    prefix = f"{rel_dir}/"
+                    stale = [k for k in self.file_expiry if k == rel_dir or k.startswith(prefix)]
+                    for k in stale:
+                        self.file_expiry.pop(k, None)
+                    if stale:
+                        save_file_expiry(self.file_expiry_path, self.file_expiry)
                 self.send_json({"ok": True})
                 self.add_activity(f"{path.name} deleted")
             elif path.is_file():
+                rel_key = str(path.resolve().relative_to(share_root)).replace(os.sep, "/")
                 path.unlink()
                 with self.file_expiry_lock:
-                    if self.file_expiry.pop(path.name, None) is not None:
+                    removed = self.file_expiry.pop(rel_key, self.file_expiry.pop(path.name, None))
+                    if removed is not None:
                         save_file_expiry(self.file_expiry_path, self.file_expiry)
                 self.send_json({"ok": True})
                 self.add_activity(f"{path.name} deleted")
@@ -6442,11 +6473,27 @@ class FileShareHandler(BaseHTTPRequestHandler):
         else:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Not found")
 
+    def _auth_cookie(self, max_age: int | None = None, clear: bool = False) -> str:
+        cls = self.__class__
+        parts = ["pura_share=", "Path=/", "HttpOnly", "SameSite=Lax"]
+        if cls.protocol == "https":
+            parts.insert(2, "Secure")
+        if clear:
+            parts[0] = "pura_share="
+            parts.insert(1, "Max-Age=0")
+        elif max_age is not None:
+            parts.insert(1, f"Max-Age={max_age}")
+        value = cls.auth_token or ""
+        parts[0] = f"pura_share={value}"
+        if clear:
+            parts[0] = "pura_share="
+        return "; ".join(parts)
+
     def handle_security_update(self) -> None:
         try:
             payload = parse_json_body(self, limit=4096)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (json.JSONDecodeError, ValueError):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
             return
 
         cls = self.__class__
@@ -6454,7 +6501,11 @@ class FileShareHandler(BaseHTTPRequestHandler):
             current_enabled = cls.auth_enabled
             current_pin = cls.pin
 
-            # If security was already enabled, verify the current PIN to authorize any change
+            # Security changes are privileged operations. If security is already
+            # enabled, the current PIN authorizes the change. If security is
+            # disabled, only a request originating from this machine may bootstrap
+            # the security settings; a LAN client must not be able to choose the
+            # initial PIN or toggle authentication on/off.
             if current_enabled:
                 given_current = str(payload.get("current_pin", "")).strip()
                 if not given_current:
@@ -6462,6 +6513,15 @@ class FileShareHandler(BaseHTTPRequestHandler):
                     return
                 if not current_pin or not secrets.compare_digest(given_current, current_pin):
                     self.send_error_json(HTTPStatus.UNAUTHORIZED, "Current PIN is incorrect")
+                    return
+            else:
+                try:
+                    peer_ip = ipaddress.ip_address(self.client_address[0])
+                    if not peer_ip.is_loopback:
+                        self.send_error_json(HTTPStatus.FORBIDDEN, "Security settings can only be initialized locally")
+                        return
+                except (ValueError, IndexError):
+                    self.send_error_json(HTTPStatus.FORBIDDEN, "Security settings can only be initialized locally")
                     return
 
             enable_target = bool(payload.get("auth_enabled"))
@@ -6495,9 +6555,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         if cls.auth_enabled and cls.auth_token:
-            self.send_header("Set-Cookie", f"pura_share={cls.auth_token}; Path=/; SameSite=Lax")
+            self.send_header("Set-Cookie", self._auth_cookie())
         else:
-            self.send_header("Set-Cookie", "pura_share=; Path=/; Max-Age=0; SameSite=Lax")
+            self.send_header("Set-Cookie", self._auth_cookie(clear=True))
         body = json.dumps({"ok": True, "auth_enabled": cls.auth_enabled, "has_pin": bool(cls.pin)}).encode("utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -6509,7 +6569,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
         if not cls.auth_enabled or not cls.pin:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Set-Cookie", f"pura_share={cls.auth_token or ''}; Path=/; SameSite=Lax")
+            self.send_header("Set-Cookie", self._auth_cookie())
             body = b'{"ok": true}'
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -6518,15 +6578,33 @@ class FileShareHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = parse_json_body(self, limit=4096)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (json.JSONDecodeError, ValueError):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
             return
+        client_key = self.client_address[0] if self.client_address else "unknown"
+        now = time.monotonic()
+        with cls.login_attempts_lock:
+            if len(cls.login_attempts) > 512:
+                cutoff = now - 300.0
+                for key, value in list(cls.login_attempts.items()):
+                    if value.get("blocked_until", 0.0) < now and value.get("last_seen", cutoff) < cutoff:
+                        cls.login_attempts.pop(key, None)
+            attempt = cls.login_attempts.get(client_key, {"failures": 0, "blocked_until": 0.0, "last_seen": now})
+            attempt["last_seen"] = now
+            if attempt.get("blocked_until", 0.0) > now:
+                retry_after = max(1, int(attempt["blocked_until"] - now))
+                self.close_connection = True
+                self.send_error_json(HTTPStatus.TOO_MANY_REQUESTS, "Too many failed PIN attempts; try again later")
+                return
+
         if secrets.compare_digest(str(payload.get("pin", "")), cls.pin):
+            with cls.login_attempts_lock:
+                cls.login_attempts.pop(client_key, None)
             trusted = bool(payload.get("trusted"))
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             max_age = "; Max-Age=604800" if trusted else ""
-            self.send_header("Set-Cookie", f"pura_share={cls.auth_token}; Path=/{max_age}; SameSite=Lax")
+            self.send_header("Set-Cookie", self._auth_cookie(604800 if trusted else None))
             body = b'{"ok": true}'
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -6534,12 +6612,19 @@ class FileShareHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             self.add_activity("Device authenticated")
         else:
+            with cls.login_attempts_lock:
+                attempt = cls.login_attempts.setdefault(client_key, {"failures": 0, "blocked_until": 0.0})
+                attempt["failures"] = min(attempt.get("failures", 0) + 1, 10)
+                if attempt["failures"] >= cls.login_max_failures:
+                    delay = min(cls.login_base_delay * (2 ** (attempt["failures"] - cls.login_max_failures)), cls.login_max_delay)
+                    attempt["blocked_until"] = time.monotonic() + delay
+            self.close_connection = True
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "Wrong PIN")
 
     def handle_logout(self) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Set-Cookie", "pura_share=; Path=/; Max-Age=0; SameSite=Lax")
+        self.send_header("Set-Cookie", self._auth_cookie(clear=True))
         body = b'{"ok": true}'
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -6601,7 +6686,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
         try:
             with temp_path.open("wb") as handle:
                 while remaining:
-                    chunk = self.rfile.read(min(CHUNK_SIZE, remaining))
+                    chunk = self.rfile.read(min(STREAM_BUFFER_SIZE, remaining))
                     if not chunk:
                         raise ConnectionError("Upload ended early")
                     handle.write(chunk)
@@ -6615,12 +6700,13 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         server_sha256 = sha256_hash.hexdigest()
 
+        rel_path = str(destination.resolve().relative_to(self.share_dir.resolve())).replace(os.sep, "/")
+
         if expires > 0:
             with self.file_expiry_lock:
-                self.file_expiry[destination.name] = time.time() + expires
+                self.file_expiry[rel_path] = time.time() + expires
                 save_file_expiry(self.file_expiry_path, self.file_expiry)
 
-        rel_path = str(destination.relative_to(self.share_dir)).replace(os.sep, "/")
         self.send_json(
             {"ok": True, "name": destination.name, "path": rel_path,
              "url": f"/files/{quote(rel_path)}", "sha256": server_sha256},
@@ -6642,19 +6728,40 @@ class FileShareHandler(BaseHTTPRequestHandler):
             for uid in stale_ids:
                 session = cls.resumable_uploads.pop(uid, None)
                 if session:
+                    handle = session.get("temp_handle")
+                    if handle:
+                        try:
+                            handle.close()
+                        except Exception:
+                            pass
                     temp_path = session.get("temp_path")
                     if temp_path:
-                        Path(temp_path).unlink(missing_ok=True)
+                        try:
+                            Path(temp_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
     def handle_upload_init(self, parsed) -> None:
         """POST /api/upload/init — Create a resumable upload session."""
         try:
             payload = parse_json_body(self, limit=8192)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (json.JSONDecodeError, ValueError):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
             return
 
-        original_name = str(payload.get("filename", ""))
+        cls = self.__class__
+        # Clean stale sessions before checking capacity
+        self.cleanup_stale_resumable()
+
+        with cls.resumable_uploads_lock:
+            if len(cls.resumable_uploads) >= MAX_ACTIVE_RESUMABLE_SESSIONS:
+                self.send_error_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    f"Maximum active upload sessions ({MAX_ACTIVE_RESUMABLE_SESSIONS}) reached. Please complete or cancel existing uploads.",
+                )
+                return
+
+        original_name = str(payload.get("filename") or payload.get("name") or "")
         total_size = payload.get("size", 0)
         sha256_expected = str(payload.get("sha256", "")).strip().lower()
         expires = int(payload.get("expires", 0) or 0)
@@ -6716,12 +6823,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
             "is_folder": is_folder,
         }
 
-        cls = self.__class__
         with cls.resumable_uploads_lock:
             cls.resumable_uploads[upload_id] = session
-
-        # Clean stale sessions periodically
-        self.cleanup_stale_resumable()
 
         self.send_json(
             {"ok": True, "upload_id": upload_id, "filename": filename, "offset": 0},
@@ -6748,54 +6851,85 @@ class FileShareHandler(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
             return
 
+        if chunk_size <= 0:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid chunk size")
+            return
+
+        if chunk_size > MAX_RESUMABLE_CHUNK_BYTES:
+            self.send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"Chunk exceeds maximum size of {MAX_RESUMABLE_CHUNK_BYTES} bytes",
+            )
+            return
+
         cls = self.__class__
         with cls.resumable_uploads_lock:
             session = cls.resumable_uploads.get(upload_id)
             if not session:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Upload session not found")
                 return
-            # Validate offset
+
+        write_lock = session["write_lock"]
+        with write_lock:
+            with cls.resumable_uploads_lock:
+                if upload_id not in cls.resumable_uploads:
+                    self.send_error_json(HTTPStatus.NOT_FOUND, "Upload session not found")
+                    return
+
             server_offset = session["received"]
+
+            # Duplicate / stale retry
             if client_offset < server_offset:
-                # Drain duplicate/stale chunk data from the socket stream to keep connection alive
                 remaining = chunk_size
                 while remaining > 0:
-                    discard = self.rfile.read(min(CHUNK_SIZE, remaining))
+                    discard = self.rfile.read(min(STREAM_BUFFER_SIZE, remaining))
                     if not discard:
                         break
                     remaining -= len(discard)
                 self.send_json({"ok": True, "offset": server_offset, "received": server_offset})
                 return
+
+            # Out-of-order chunk
             if client_offset > server_offset:
+                remaining = chunk_size
+                while remaining > 0:
+                    discard = self.rfile.read(min(STREAM_BUFFER_SIZE, remaining))
+                    if not discard:
+                        break
+                    remaining -= len(discard)
                 self.send_error_json(
                     HTTPStatus.CONFLICT,
                     f"Offset mismatch: client={client_offset}, server={server_offset}",
                 )
                 return
-            # Check if this chunk would exceed total size
+
+            # Chunk would exceed total size
             if server_offset + chunk_size > session["total_size"]:
+                remaining = chunk_size
+                while remaining > 0:
+                    discard = self.rfile.read(min(STREAM_BUFFER_SIZE, remaining))
+                    if not discard:
+                        break
+                    remaining -= len(discard)
                 self.send_error_json(HTTPStatus.BAD_REQUEST, "Chunk would exceed total file size")
                 return
+
             temp_handle = session["temp_handle"]
-            write_lock = session["write_lock"]
             sha256_hash = session["sha256_hash"]
 
-        # Read incoming chunk data into memory first to guarantee atomic write on network loss
-        chunk_data = bytearray()
-        remaining = chunk_size
-        try:
-            while remaining > 0:
-                data = self.rfile.read(min(CHUNK_SIZE, remaining))
-                if not data:
-                    raise ConnectionError("Chunk upload ended early")
-                chunk_data.extend(data)
-                remaining -= len(data)
-        except Exception:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, "Chunk read interrupted")
-            return
+            chunk_data = bytearray()
+            remaining = chunk_size
+            try:
+                while remaining > 0:
+                    data = self.rfile.read(min(STREAM_BUFFER_SIZE, remaining))
+                    if not data:
+                        raise ConnectionError("Chunk upload ended early")
+                    chunk_data.extend(data)
+                    remaining -= len(data)
+            except Exception:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "Chunk read interrupted")
+                return
 
-        # Atomically write complete verified chunk to disk and update running hash
-        with write_lock:
             try:
                 temp_handle.seek(server_offset)
                 temp_handle.write(chunk_data)
@@ -6805,21 +6939,26 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Chunk write failed")
                 return
 
-        # Update session
-        with cls.resumable_uploads_lock:
-            session = cls.resumable_uploads.get(upload_id)
-            if session:
-                session["received"] = server_offset + chunk_size
-                session["last_activity"] = time.time()
-                new_offset = session["received"]
-            else:
-                self.send_error_json(HTTPStatus.NOT_FOUND, "Upload session expired")
-                return
+            session["received"] = server_offset + len(chunk_data)
+            session["last_activity"] = time.time()
+            new_offset = session["received"]
 
         self.send_json({"ok": True, "offset": new_offset, "received": new_offset})
 
     def handle_upload_complete(self, parsed) -> None:
-        """POST /api/upload/complete?id=<upload_id> — Finalize a resumable upload."""
+        query = parse_qs(parsed.query)
+        upload_id = query.get("id", [""])[0]
+        cls = self.__class__
+        with cls.resumable_uploads_lock:
+            session = cls.resumable_uploads.get(upload_id)
+        if not session:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Upload session not found")
+            return
+        with session["write_lock"]:
+            self._handle_upload_complete_locked(parsed)
+
+    def _handle_upload_complete_locked(self, parsed) -> None:
+        """Internal completion implementation; caller holds the per-upload lock."""
         query = parse_qs(parsed.query)
         upload_id = query.get("id", [""])[0]
 
@@ -6853,6 +6992,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         # SHA-256 verification
         if expected_sha256 and expected_sha256 != server_sha256:
+            temp_path.unlink(missing_ok=True)
+            with cls.resumable_uploads_lock:
+                cls.resumable_uploads.pop(upload_id, None)
             self.send_error_json(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
                 f"SHA-256 mismatch: expected {expected_sha256}, got {server_sha256}",
@@ -6862,37 +7004,43 @@ class FileShareHandler(BaseHTTPRequestHandler):
         # Determine destination path
         if session.get("is_folder") and "/" in session["filename"]:
             target = self.share_dir / session["filename"].replace("/", os.sep)
-            target.parent.mkdir(parents=True, exist_ok=True)
             try:
-                target.resolve().relative_to(self.share_dir.resolve())
-            except ValueError:
+                resolved_target = target.resolve(strict=False)
+                resolved_target.relative_to(self.share_dir.resolve())
+                resolved_parent = resolved_target.parent
+                resolved_parent.relative_to(self.share_dir.resolve())
+            except (OSError, ValueError):
                 temp_path.unlink(missing_ok=True)
                 with cls.resumable_uploads_lock:
                     cls.resumable_uploads.pop(upload_id, None)
                 self.send_error_json(HTTPStatus.BAD_REQUEST, "Path traversal detected")
                 return
-            destination = target
+            destination = resolved_target
         else:
             destination = unique_path(self.share_dir, session["filename"])
 
         try:
             os.replace(temp_path, destination)
         except OSError as exc:
+            temp_path.unlink(missing_ok=True)
+            with cls.resumable_uploads_lock:
+                cls.resumable_uploads.pop(upload_id, None)
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Finalize failed")
             return
 
-        # Set expiry
+        rel_path = str(destination.resolve().relative_to(self.share_dir.resolve())).replace(os.sep, "/")
+
+        # Set expiry using relative path
         expires = session.get("expires", 0)
         if expires and expires > 0:
             with self.file_expiry_lock:
-                self.file_expiry[destination.name] = time.time() + expires
+                self.file_expiry[rel_path] = time.time() + expires
                 save_file_expiry(self.file_expiry_path, self.file_expiry)
 
         # Clean up session
         with cls.resumable_uploads_lock:
             cls.resumable_uploads.pop(upload_id, None)
 
-        rel_path = str(destination.relative_to(self.share_dir)).replace(os.sep, "/")
         self.send_json(
             {"ok": True, "name": destination.name, "path": rel_path,
              "url": f"/files/{quote(rel_path)}", "sha256": server_sha256,
@@ -6919,6 +7067,7 @@ class FileShareHandler(BaseHTTPRequestHandler):
             "filename": session["filename"],
             "total_size": session["total_size"],
             "received": session["received"],
+            "offset": session["received"],
             "status": "complete" if session["received"] == session["total_size"] else "uploading",
         })
 
@@ -6929,28 +7078,36 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         cls = self.__class__
         with cls.resumable_uploads_lock:
-            session = cls.resumable_uploads.pop(upload_id, None)
+            session = cls.resumable_uploads.get(upload_id)
 
         if not session:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Upload session not found")
             return
 
-        temp_handle = session.get("temp_handle")
-        if temp_handle:
-            try:
-                temp_handle.close()
-            except Exception:
-                pass
+        with session["write_lock"]:
+            with cls.resumable_uploads_lock:
+                session = cls.resumable_uploads.pop(upload_id, None)
+            if not session:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "Upload session not found")
+                return
 
-        temp_path = Path(session["temp_path"])
-        temp_path.unlink(missing_ok=True)
-        self.send_json({"ok": True})
+            temp_handle = session.get("temp_handle")
+            if temp_handle:
+                try:
+                    temp_handle.close()
+                except Exception:
+                    pass
+
+            temp_path = Path(session["temp_path"])
+            temp_path.unlink(missing_ok=True)
+            self.send_json({"ok": True})
+
 
     def create_clipboard(self) -> None:
         try:
             payload = parse_json_body(self, limit=MAX_CLIPBOARD_BYTES + 4096)
-        except (json.JSONDecodeError, ValueError) as exc:
-            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (json.JSONDecodeError, ValueError):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
             return
         text = str(payload.get("text", ""))
         if not text.strip():
@@ -7031,7 +7188,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 stat = path.stat()
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 with self.file_expiry_lock:
-                    expires_at = self.file_expiry.get(path.name)
+                    rel_key = str(path.relative_to(self.share_dir)).replace(os.sep, "/")
+                    expires_at = self.file_expiry.get(rel_key, self.file_expiry.get(path.name))
                 items.append({
                     "name": path.name,
                     "path": path.name,
@@ -7052,18 +7210,52 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         all_files: list[Path] = []
         for path in self.share_dir.rglob("*"):
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
             if any(part.startswith(".") for part in path.relative_to(self.share_dir).parts):
                 continue
             try:
-                path.resolve().relative_to(share_root)
-            except ValueError:
+                resolved_path = path.resolve()
+                resolved_path.relative_to(share_root)
+            except (OSError, ValueError):
                 continue
-            all_files.append(path)
+            all_files.append(resolved_path)
+            if len(all_files) > MAX_ZIP_FILES:
+                self.send_error_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    f"Too many files to include in one ZIP archive (maximum {MAX_ZIP_FILES:,}).",
+                )
+                return
 
         if not all_files:
             self.send_error_json(HTTPStatus.NOT_FOUND, "No files to download")
+            return
+
+        cls = self.__class__
+        if not cls.zip_semaphore.acquire(blocking=False):
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Another ZIP archive is currently being assembled. Please retry in a few moments.",
+            )
+            return
+
+        try:
+            total_bytes = sum(p.stat().st_size for p in all_files)
+            free_disk = shutil.disk_usage(tempfile.gettempdir()).free
+            required_disk = int(total_bytes * 1.1) + 100 * 1024 * 1024
+            if free_disk < required_disk:
+                self.send_error_json(
+                    HTTPStatus.INSUFFICIENT_STORAGE,
+                    "Insufficient temporary disk space to assemble ZIP archive.",
+                )
+                cls.zip_semaphore.release()
+                return
+        except (OSError, ValueError) as exc:
+            cls.zip_semaphore.release()
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Unable to safely verify temporary disk space for ZIP archive.",
+            )
             return
 
         temp_path: Path | None = None
@@ -7072,13 +7264,23 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 temp_path = Path(temp_file.name)
             with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
                 for path in all_files:
-                    arcname = str(path.relative_to(self.share_dir))
-                    archive.write(path, arcname=arcname)
+                    try:
+                        safe_path = path.resolve()
+                        safe_path.relative_to(share_root)
+                    except (OSError, ValueError) as exc:
+                        raise ValueError("ZIP source escaped the shared folder") from exc
+                    if not safe_path.is_file() or safe_path.name.startswith("."):
+                        raise ValueError("ZIP source is no longer a regular shared file")
+                    arcname = str(safe_path.relative_to(share_root)).replace(os.sep, "/")
+                    archive.write(safe_path, arcname=arcname)
             stat = temp_path.stat()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             if temp_path:
                 temp_path.unlink(missing_ok=True)
-            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Download all failed")
+            cls.zip_semaphore.release()
+            message = "Download all failed" if isinstance(exc, OSError) else "ZIP source escaped the shared folder"
+            status = HTTPStatus.INTERNAL_SERVER_ERROR if isinstance(exc, OSError) else HTTPStatus.BAD_REQUEST
+            self.send_error_json(status, message)
             return
 
         self.send_response(HTTPStatus.OK)
@@ -7100,7 +7302,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
         else:
             self.add_activity("ZIP downloaded")
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+            cls.zip_semaphore.release()
 
     def send_folder_zip(self, encoded_folder: str) -> None:
         """Download a specific folder as a ZIP archive."""
@@ -7121,11 +7325,51 @@ class FileShareHandler(BaseHTTPRequestHandler):
 
         all_files: list[Path] = []
         for path in folder_path.rglob("*"):
-            if path.is_file() and not any(p.startswith(".") for p in path.relative_to(folder_path).parts):
-                all_files.append(path)
+            if path.is_symlink() or not path.is_file() or any(p.startswith(".") for p in path.relative_to(folder_path).parts):
+                continue
+            try:
+                resolved_path = path.resolve()
+                resolved_path.relative_to(share_root)
+            except (OSError, ValueError):
+                # Never include symlinks or paths that resolve outside the shared root.
+                continue
+            all_files.append(resolved_path)
+            if len(all_files) > MAX_ZIP_FILES:
+                self.send_error_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    f"Too many files to include in one ZIP archive (maximum {MAX_ZIP_FILES:,}).",
+                )
+                return
 
         if not all_files:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Folder is empty")
+            return
+
+        cls = self.__class__
+        if not cls.zip_semaphore.acquire(blocking=False):
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Another ZIP archive is currently being assembled. Please retry in a few moments.",
+            )
+            return
+
+        try:
+            total_bytes = sum(p.stat().st_size for p in all_files)
+            free_disk = shutil.disk_usage(tempfile.gettempdir()).free
+            required_disk = int(total_bytes * 1.1) + 100 * 1024 * 1024
+            if free_disk < required_disk:
+                self.send_error_json(
+                    HTTPStatus.INSUFFICIENT_STORAGE,
+                    "Insufficient temporary disk space to assemble ZIP archive.",
+                )
+                cls.zip_semaphore.release()
+                return
+        except (OSError, ValueError) as exc:
+            cls.zip_semaphore.release()
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Unable to safely verify temporary disk space for ZIP archive.",
+            )
             return
 
         temp_path: Path | None = None
@@ -7134,13 +7378,23 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 temp_path = Path(temp_file.name)
             with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
                 for path in all_files:
-                    arcname = str(path.relative_to(folder_path.parent))
-                    archive.write(path, arcname=arcname)
+                    try:
+                        safe_path = path.resolve()
+                        safe_path.relative_to(share_root)
+                    except (OSError, ValueError) as exc:
+                        raise ValueError("ZIP source escaped the shared folder") from exc
+                    if not safe_path.is_file() or safe_path.name.startswith("."):
+                        raise ValueError("ZIP source is no longer a regular shared file")
+                    arcname = str(safe_path.relative_to(share_root)).replace(os.sep, "/")
+                    archive.write(safe_path, arcname=arcname)
             stat = temp_path.stat()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             if temp_path:
                 temp_path.unlink(missing_ok=True)
-            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Folder download failed")
+            cls.zip_semaphore.release()
+            message = "Folder download failed" if isinstance(exc, OSError) else "ZIP source escaped the shared folder"
+            status = HTTPStatus.INTERNAL_SERVER_ERROR if isinstance(exc, OSError) else HTTPStatus.BAD_REQUEST
+            self.send_error_json(status, message)
             return
 
         safe_name = sanitize_filename(folder_name)
@@ -7162,7 +7416,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
         else:
             self.add_activity("ZIP downloaded")
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+            cls.zip_semaphore.release()
 
     def handle_download_selected_zip(self) -> None:
         """Download arbitrary selected files and folders as a streamed ZIP archive."""
@@ -7174,8 +7430,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
             try:
                 payload = parse_json_body(self, limit=128 * 1024)
                 file_list = payload.get("files", [])
-            except (json.JSONDecodeError, ValueError) as exc:
-                self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except (json.JSONDecodeError, ValueError):
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request body")
                 return
         else:
             query = parse_qs(urlparse(self.path).query)
@@ -7200,6 +7456,13 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid path in selection")
                 return
 
+            raw_path = self.share_dir / name
+            try:
+                if raw_path.is_symlink():
+                    continue
+            except OSError:
+                continue
+
             path = self.resolve_shared_path(name)
             if path is None or not path.exists():
                 continue
@@ -7215,16 +7478,62 @@ class FileShareHandler(BaseHTTPRequestHandler):
                     seen_paths.add(resolved)
                     arcname = str(resolved.relative_to(share_root)).replace(os.sep, "/")
                     resolved_files.append((resolved, arcname))
+                    if len(resolved_files) > MAX_ZIP_FILES:
+                        self.send_error_json(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            f"Too many files to include in one ZIP archive (maximum {MAX_ZIP_FILES:,}).",
+                        )
+                        return
             elif resolved.is_dir() and not resolved.name.startswith("."):
                 for sub_item in resolved.rglob("*"):
-                    if sub_item.is_file() and not any(p.startswith(".") for p in sub_item.relative_to(share_root).parts):
-                        if sub_item not in seen_paths:
-                            seen_paths.add(sub_item)
-                            arcname = str(sub_item.relative_to(share_root)).replace(os.sep, "/")
-                            resolved_files.append((sub_item, arcname))
+                    if sub_item.is_symlink() or not sub_item.is_file() or any(p.startswith(".") for p in sub_item.relative_to(share_root).parts):
+                        continue
+                    try:
+                        safe_item = sub_item.resolve()
+                        safe_item.relative_to(share_root)
+                    except (OSError, ValueError):
+                        continue
+                    if safe_item in seen_paths:
+                        continue
+                    seen_paths.add(safe_item)
+                    arcname = str(safe_item.relative_to(share_root)).replace(os.sep, "/")
+                    resolved_files.append((safe_item, arcname))
+                    if len(resolved_files) > MAX_ZIP_FILES:
+                        self.send_error_json(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            f"Too many files to include in one ZIP archive (maximum {MAX_ZIP_FILES:,}).",
+                        )
+                        return
 
         if not resolved_files:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Selected files not found")
+            return
+
+        cls = self.__class__
+        if not cls.zip_semaphore.acquire(blocking=False):
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Another ZIP archive is currently being assembled. Please retry in a few moments.",
+            )
+            return
+
+        try:
+            total_bytes = sum(abs_path.stat().st_size for abs_path, _ in resolved_files)
+            free_disk = shutil.disk_usage(tempfile.gettempdir()).free
+            required_disk = int(total_bytes * 1.1) + 100 * 1024 * 1024
+            if free_disk < required_disk:
+                self.send_error_json(
+                    HTTPStatus.INSUFFICIENT_STORAGE,
+                    "Insufficient temporary disk space to assemble ZIP archive.",
+                )
+                cls.zip_semaphore.release()
+                return
+        except (OSError, ValueError) as exc:
+            cls.zip_semaphore.release()
+            self.send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Unable to safely verify temporary disk space for ZIP archive.",
+            )
             return
 
         temp_path: Path | None = None
@@ -7233,12 +7542,22 @@ class FileShareHandler(BaseHTTPRequestHandler):
                 temp_path = Path(temp_file.name)
             with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
                 for abs_path, arcname in resolved_files:
-                    archive.write(abs_path, arcname=arcname)
+                    try:
+                        safe_path = abs_path.resolve()
+                        safe_path.relative_to(share_root)
+                    except (OSError, ValueError) as exc:
+                        raise ValueError("ZIP source escaped the shared folder") from exc
+                    if not safe_path.is_file() or safe_path.name.startswith("."):
+                        raise ValueError("ZIP source is no longer a regular shared file")
+                    archive.write(safe_path, arcname=arcname)
             stat = temp_path.stat()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             if temp_path:
                 temp_path.unlink(missing_ok=True)
-            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Download selected failed")
+            cls.zip_semaphore.release()
+            message = "Download selected failed" if isinstance(exc, OSError) else "ZIP source escaped the shared folder"
+            status = HTTPStatus.INTERNAL_SERVER_ERROR if isinstance(exc, OSError) else HTTPStatus.BAD_REQUEST
+            self.send_error_json(status, message)
             return
 
         zip_name = f"Selected_{datetime.now().strftime('%H_%M_%d_%m_%y')}.zip"
@@ -7260,7 +7579,9 @@ class FileShareHandler(BaseHTTPRequestHandler):
         else:
             self.add_activity("ZIP downloaded")
         finally:
-            temp_path.unlink(missing_ok=True)
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+            cls.zip_semaphore.release()
 
     def delete_all_files(self) -> None:
         self.cleanup_expired_files()
@@ -7292,11 +7613,8 @@ class FileShareHandler(BaseHTTPRequestHandler):
             except OSError:
                 failed.append(path.name)
         with self.file_expiry_lock:
-            modified = False
-            for path in files:
-                if self.file_expiry.pop(path.name, None) is not None:
-                    modified = True
-            if modified:
+            if self.file_expiry:
+                self.file_expiry.clear()
                 save_file_expiry(self.file_expiry_path, self.file_expiry)
         if failed:
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"Could not delete: {', '.join(failed[:3])}")
@@ -7430,38 +7748,25 @@ class FileShareHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
-    def cleanup_stale_resumable(self) -> None:
-        now = time.time()
-        cls = self.__class__
-        stale_ids = []
-        with cls.resumable_uploads_lock:
-            for upload_id, session in list(cls.resumable_uploads.items()):
-                if now - session.get("last_activity", now) > 3600:
-                    stale_ids.append((upload_id, session.get("temp_path")))
-                    cls.resumable_uploads.pop(upload_id, None)
-        for _, temp_path in stale_ids:
-            if temp_path:
-                try:
-                    Path(temp_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-
     def cleanup_expired_files(self) -> None:
         now = time.time()
         expired = []
+        share_root = self.share_dir.resolve()
         with self.file_expiry_lock:
-            for name, expires_at in list(self.file_expiry.items()):
+            for rel_key, expires_at in list(self.file_expiry.items()):
                 if expires_at <= now:
-                    expired.append(name)
-                    self.file_expiry.pop(name, None)
+                    expired.append(rel_key)
+                    self.file_expiry.pop(rel_key, None)
             if expired:
                 save_file_expiry(self.file_expiry_path, self.file_expiry)
-        for name in expired:
-            path = self.share_dir / name
+        for rel_key in expired:
             try:
-                if path.is_file():
-                    path.unlink()
-            except OSError:
+                target = (self.share_dir / rel_key.replace("/", os.sep)).resolve()
+                target.relative_to(share_root)
+                if target.is_file():
+                    target.unlink()
+                    self.add_activity(f"{target.name} expired")
+            except (OSError, ValueError):
                 pass
         self.cleanup_stale_resumable()
 
@@ -7551,6 +7856,9 @@ def build_handler(
     port: int = 8000,
     discovery_service: LanDiscoveryService | None = None,
 ) -> type[FileShareHandler]:
+    share_dir = Path(share_dir).resolve()
+    asset_dir = Path(asset_dir).resolve()
+
     class ConfiguredFileShareHandler(FileShareHandler):
         pass
 
@@ -7594,6 +7902,11 @@ def build_handler(
     ConfiguredFileShareHandler.auth_enabled = auth_enabled
     ConfiguredFileShareHandler.pin = resolved_pin
     ConfiguredFileShareHandler.auth_token = secrets.token_urlsafe(32)
+    ConfiguredFileShareHandler.login_attempts = {}
+    ConfiguredFileShareHandler.login_attempts_lock = threading.Lock()
+    ConfiguredFileShareHandler.login_max_failures = 5
+    ConfiguredFileShareHandler.login_base_delay = 1.0
+    ConfiguredFileShareHandler.login_max_delay = 30.0
     ConfiguredFileShareHandler.config_path = config_path
     ConfiguredFileShareHandler.config_lock = threading.Lock()
     ConfiguredFileShareHandler.clipboard_store_path = share_dir / "clipboard_texts" / "clipboard_items.json"
@@ -7622,8 +7935,33 @@ def build_handler(
 
     ConfiguredFileShareHandler.resumable_uploads = {}
     ConfiguredFileShareHandler.resumable_uploads_lock = threading.Lock()
+    ConfiguredFileShareHandler.active_sse_clients = 0
+    ConfiguredFileShareHandler.sse_lock = threading.Lock()
+    ConfiguredFileShareHandler.zip_semaphore = threading.Semaphore(MAX_CONCURRENT_ZIPS)
     ConfiguredFileShareHandler.activity_events = [{"message": "Server started", "time": datetime.now().strftime("%H:%M:%S")}]
     ConfiguredFileShareHandler.activity_lock = threading.Lock()
+
+    def cleanup_on_shutdown():
+        try:
+            with ConfiguredFileShareHandler.resumable_uploads_lock:
+                for session in list(ConfiguredFileShareHandler.resumable_uploads.values()):
+                    handle = session.get("temp_handle")
+                    if handle:
+                        try:
+                            handle.close()
+                        except Exception:
+                            pass
+                    tpath = session.get("temp_path")
+                    if tpath:
+                        try:
+                            Path(tpath).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                ConfiguredFileShareHandler.resumable_uploads.clear()
+        except Exception:
+            pass
+
+    atexit.register(cleanup_on_shutdown)
     return ConfiguredFileShareHandler
 
 
@@ -7682,8 +8020,19 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
     args = parse_args()
-    share_dir = Path(args.dir).expanduser().resolve()
-    share_dir.mkdir(parents=True, exist_ok=True)
+    if args.port < 1 or args.port > 65535:
+        print(f"Error: Invalid port number {args.port}. Port must be between 1 and 65535.", file=sys.stderr)
+        sys.exit(1)
+    if args.max_upload_gb <= 0:
+        print(f"Error: Invalid max upload size {args.max_upload_gb}. Must be greater than 0.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        share_dir = Path(args.dir).expanduser().resolve()
+        share_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        print(f"Error: Cannot access or create share directory '{args.dir}': {err.strerror or err}", file=sys.stderr)
+        sys.exit(1)
 
     protocol = "https" if args.https else "http"
     lan_ip = get_lan_ip()
@@ -7699,7 +8048,7 @@ def main() -> None:
         all_detected_ips = get_all_lan_ips()
         required_ips = list(dict.fromkeys(all_detected_ips + ["127.0.0.1", lan_ip]))
 
-        if args.cert or args.key:
+        if (args.cert or args.key) and not args.auto_cert:
             if not cert_path.exists() or not key_path.exists():
                 print(f"Error: Specified TLS certificate ({cert_path}) or key ({key_path}) not found.", file=sys.stderr)
                 sys.exit(1)
@@ -7727,7 +8076,6 @@ def main() -> None:
     # Initialize LAN Discovery
     discovery_service = None
     if not args.no_discovery:
-        hostname = socket.gethostname()
         server_id = f"pura-{secrets.token_hex(4)}"
         server_name = "Pura Server"
         discovery_service = LanDiscoveryService(
@@ -7753,7 +8101,17 @@ def main() -> None:
         port=args.port,
         discovery_service=discovery_service,
     )
-    server = PuraHTTPServer((args.host, args.port), handler)
+    # Discovery must advertise the handler's actual authentication state.
+    if discovery_service is not None:
+        discovery_service.auth_enabled = bool(handler.auth_enabled)
+    try:
+        server = PuraHTTPServer((args.host, args.port), handler)
+    except OSError as err:
+        if discovery_service:
+            discovery_service.stop()
+        print(f"Error: Could not bind to {args.host}:{args.port} - {err.strerror or err}", file=sys.stderr)
+        print(f"Tip: Port {args.port} may already be in use. Try specifying another port with --port <number>.", file=sys.stderr)
+        sys.exit(1)
     if ssl_context:
         server.ssl_context = ssl_context
 
